@@ -1,0 +1,95 @@
+name: Build AX6000 ImmortalWrt with TC BPF
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source branch or exact commit (pin a commit for reproducibility)'
+        required: true
+        default: '25.12'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
+            gettext git libncurses-dev libssl-dev python3 python3-setuptools \
+            python3-pyelftools rsync swig unzip zlib1g-dev file wget curl \
+            subversion ca-certificates jq time xz-utils zstd
+
+      - name: Clone upstream source
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          git clone https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git openwrt
+          cd openwrt
+          git checkout "$SOURCE_REF"
+          git rev-parse HEAD | tee ../source-commit.txt
+
+      - name: Prepare feeds and configuration
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          cp defconfig/mt7986-ax6000.config .config
+          # Remove all previously selected target device profiles; enable MTK U-Boot AX6000 only.
+          sed -i -E '/^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$/d' .config
+          printf '\n%s\n' \
+            'CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_xiaomi_redmi-router-ax6000-mtkuboot=y' \
+            'CONFIG_PACKAGE_kmod-sched-bpf=y' >> .config
+          make defconfig
+          grep -E '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y$' .config
+          if ! grep -qx 'CONFIG_PACKAGE_kmod-sched-bpf=y' .config; then
+            echo 'ERROR: kmod-sched-bpf is unavailable or its dependencies are unmet.' >&2
+            grep -Ei 'sched.bpf|NET_CLS_BPF|NET_ACT_BPF' .config || true
+            exit 1
+          fi
+          cp .config ../build.config
+          git rev-parse HEAD > ../source-commit.txt
+
+      - name: Download sources
+        working-directory: openwrt
+        run: |
+          make download -j2 V=s
+          find dl -type f -size -1024c -print
+
+      - name: Build firmware and APKs
+        working-directory: openwrt
+        run: make -j2 V=s
+
+      - name: Verify outputs
+        run: |
+          find openwrt/bin/targets/mediatek/filogic -maxdepth 2 -type f -print
+          find openwrt/bin -name 'kmod-sched-bpf*.apk' -print | tee bpf-packages.txt
+          test -s bpf-packages.txt
+          find openwrt/bin/targets/mediatek/filogic -maxdepth 1 -name '*redmi-router-ax6000-mtkuboot*sysupgrade*' -print | tee firmware-images.txt
+          test -s firmware-images.txt
+          sha256sum $(cat bpf-packages.txt) $(cat firmware-images.txt) > SHA256SUMS-selected.txt
+
+      - name: Upload firmware and package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax6000-mtkuboot-with-sched-bpf
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*redmi-router-ax6000-mtkuboot*sysupgrade*
+            openwrt/bin/targets/mediatek/filogic/*.buildinfo
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/bin/packages/**/kmod-sched-bpf*.apk
+            openwrt/bin/targets/mediatek/filogic/packages/kmod-sched-bpf*.apk
+            build.config
+            source-commit.txt
+            SHA256SUMS-selected.txt
+          if-no-files-found: error
+          retention-days: 14
